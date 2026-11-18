@@ -130,42 +130,15 @@ def _has_audio_stream(video_path: Path) -> bool:
 def _extract_driving_kp(
     frame_rgb: np.ndarray,
     loader: AvatarLoader,
-    prev_lmk203: np.ndarray | None,
+    prev_lmk203: np.ndarray | None = None,
 ) -> tuple[KPInfo | None, np.ndarray | None]:
-    """Extract KPInfo from one RGB frame, using landmark tracking when available."""
+    """Extract KPInfo from one RGB frame, verifying a face is detected via SCRFD."""
+    _ = prev_lmk203
     img_f64 = frame_rgb.astype(np.float64)
-    lmk203_pts: np.ndarray | None = None
-
-    if prev_lmk203 is not None:
-        try:
-            crop_224 = crop_image(
-                img_f64,
-                prev_lmk203,
-                dsize=_LM203_DSIZE,
-                scale=1.5,
-                vx_ratio=0.0,
-                vy_ratio=-0.1,
-                flag_do_rot=True,
-            )
-            lmk203_pts = landmark203(crop_224.img_crop, crop_224.M_c2o, lm203=loader.lmk203)
-            crop_512 = crop_image(
-                img_f64,
-                lmk203_pts,
-                dsize=512,
-                scale=loader.crop_cfg.scale,
-                vx_ratio=loader.crop_cfg.vx_ratio,
-                vy_ratio=loader.crop_cfg.vy_ratio,
-                flag_do_rot=loader.crop_cfg.flag_do_rot,
-            )
-            img_crop_512 = crop_512.img_crop
-        except Exception:
-            lmk203_pts = None
-
-    if lmk203_pts is None:
-        try:
-            img_crop_512, _, lmk203_pts = loader._crop_512(img_f64)
-        except RuntimeError:
-            return None, None
+    try:
+        img_crop_512, _, lmk203_pts = loader._crop_512(img_f64)
+    except RuntimeError:
+        return None, None
 
     rgb_256 = _img_crop_to_bchw256(img_crop_512)
     rgb_256_t = torch.from_numpy(rgb_256).cuda()
@@ -418,6 +391,123 @@ class MicrophoneAudioDriver:
 # ---------------------------------------------------------------------------
 
 
+def _compute_avatar_crop_boxes(
+    avatar: Avatar,
+    loader: AvatarLoader,
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    """Compute (full_4_3_box, face_crop_4_3_box) as (x1, y1, x2, y2) on the 1280x720 frame.
+
+    - ``full_4_3_box``: 960x720 (4:3) window centered horizontally on the avatar's face.
+    - ``face_crop_4_3_box``: 4:3 window spanning from ~2 cm above the eyebrows to
+      ~2 cm below the lower lip (where eyebrow-to-lower-lip on an adult face is ~10 cm,
+      so 2 cm is 0.20 * H_brow_to_lip above the eyebrows and below the lower lip).
+    """
+    from avtr1_renderer.components.face_detection import detect_faces
+    from avtr1_renderer.components.face_landmarks import landmark106
+
+    h, w = int(avatar.source.shape[-2]), int(avatar.source.shape[-1])  # 720, 1280
+    target_w_full = int(round(h * 4.0 / 3.0))  # 960
+
+    src_rgb = (
+        avatar.source.permute(1, 2, 0).detach().cpu().numpy() * 255.0
+    ).astype(np.float64)
+
+    try:
+        det, _ = detect_faces(src_rgb, det=loader.det)
+        order = np.argsort(-(det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1]))
+        bbox = det[order[0]]
+        lmk106_pts = landmark106(src_rgb, bbox, lm106=loader.lmk106)
+        _, _, lmk203_pts = loader._crop_512(src_rgb)
+
+        cx = float(0.5 * (lmk203_pts[:, 0].min() + lmk203_pts[:, 0].max()))
+        y_eyebrow = float(min(lmk106_pts[:, 1].min(), lmk203_pts[:, 1].min()))
+        y_chin = float(max(lmk106_pts[:, 1].max(), lmk203_pts[:, 1].max()))
+
+        # In InsightFace 106-landmark layout, indices 52..71 are the mouth/lips.
+        lip_max_y = float(lmk106_pts[52:72, 1].max())
+        expected_min = y_eyebrow + 0.55 * (y_chin - y_eyebrow)
+        expected_max = y_eyebrow + 0.90 * (y_chin - y_eyebrow)
+        if expected_min <= lip_max_y <= expected_max:
+            y_lower_lip = lip_max_y
+        else:
+            y_lower_lip = y_eyebrow + 0.78 * (y_chin - y_eyebrow)
+
+        # Eyebrow-to-lower-lip is ~10 cm on an adult human face -> 2 cm = 0.20 * H_brow_to_lip
+        h_brow_to_lip = max(40.0, y_lower_lip - y_eyebrow)
+        margin_0_8_cm = 0.08 * h_brow_to_lip
+        margin_1_5_cm = 0.15 * h_brow_to_lip
+
+        y1_f = y_eyebrow - margin_0_8_cm
+        y2_f = y_lower_lip + margin_1_5_cm
+        crop_h = min(float(h), max(80.0, y2_f - y1_f))
+        crop_w = min(float(w), crop_h * (4.0 / 3.0))
+        crop_h = crop_w * (3.0 / 4.0)
+
+        cy = 0.5 * (y1_f + y2_f)
+        fy1 = int(round(np.clip(cy - 0.5 * crop_h, 0, h - crop_h)))
+        fy2 = fy1 + int(round(crop_h))
+        fx1 = int(round(np.clip(cx - 0.5 * crop_w, 0, w - crop_w)))
+        fx2 = fx1 + int(round(crop_w))
+        face_box = (fx1, fy1, fx2, fy2)
+    except Exception:
+        cx = w * 0.5
+        face_box = ((w - 480) // 2, (h - 360) // 2, (w + 480) // 2, (h + 360) // 2)
+
+    full_x1 = int(round(np.clip(cx - 0.5 * target_w_full, 0, w - target_w_full)))
+    full_x2 = full_x1 + target_w_full
+    full_box = (full_x1, 0, full_x2, h)
+    return full_box, face_box
+
+
+def _crop_to_4_3(
+    img: np.ndarray,
+    box: tuple[int, int, int, int],
+    out_w: int,
+    out_h: int,
+) -> np.ndarray:
+    x1, y1, x2, y2 = box
+    cropped = img[y1:y2, x1:x2]
+    if cropped.shape[1] == out_w and cropped.shape[0] == out_h:
+        return np.ascontiguousarray(cropped)
+    return cv2.resize(cropped, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _build_cylindrical_remap(
+    box: tuple[int, int, int, int],
+    out_w: int,
+    out_h: int,
+    fov_deg: float = 90.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute cv2.remap tables for projecting the planar face crop onto a
+    vertical cylinder covering ``fov_deg`` (90 degrees) along the horizontal axis.
+
+    For normalized output coordinates (u_hat, v_hat) in [-1, 1] x [-1, 1]:
+        theta = u_hat * (fov_rad / 2)
+        x_planar = sin(theta)
+        y_planar = v_hat   (unmodified in y)
+    This elongates the image horizontally along x to compensate for the 90-deg
+    cylindrical curvature while leaving y completely unmodified.
+    """
+    x1, y1, x2, y2 = box
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+    half_w = 0.5 * (x2 - x1)
+    half_h = 0.5 * (y2 - y1)
+
+    half_fov = np.deg2rad(fov_deg * 0.5)
+
+    u_hat = np.linspace(-1.0, 1.0, out_w, dtype=np.float32)  # (out_w,)
+    v_hat = np.linspace(-1.0, 1.0, out_h, dtype=np.float32)  # (out_h,)
+
+    theta = u_hat * float(half_fov)  # (out_w,) in [-pi/4, +pi/4]
+    x_src_norm = np.sin(theta)  # (out_w,) in [-sqrt(2)/2, +sqrt(2)/2]
+
+    # Broadcast to (out_h, out_w): elongated along x, unmodified in y
+    map_x = (cx + x_src_norm[None, :] * half_w).repeat(out_h, axis=0).astype(np.float32)
+    map_y = (cy + v_hat[:, None] * half_h).repeat(out_w, axis=1).astype(np.float32)
+    return map_x, map_y
+
+
 class WebcamAvatarDriver:
     """Captures webcam frames and drives the AVTR-1 renderer in a background thread."""
 
@@ -438,6 +528,7 @@ class WebcamAvatarDriver:
         relative: bool = True,
         lipsync_only: bool = False,
         lipsync_only_static_head: bool = False,
+        crop_to_face: bool = False,
         mic_audio_mode: bool = False,
         mic_device_name: str = "",
         mic_index: int | None = None,
@@ -445,6 +536,8 @@ class WebcamAvatarDriver:
         record_out: Path | None = None,
     ) -> None:
         self.avatar = avatar
+        self._default_avatar = avatar
+        self._avatar_lock = threading.Lock()
         self.bg = bg
         self.loader = loader
         self.stitch = stitch
@@ -455,24 +548,32 @@ class WebcamAvatarDriver:
         self.relative = relative
         self.lipsync_only = lipsync_only
         self.lipsync_only_static_head = lipsync_only_static_head
+        self.crop_to_face = crop_to_face
         self.mic_audio_mode = mic_audio_mode
         self.hybrid_webcam_mic = False
         self.use_virtual_cam = use_virtual_cam
         self.record_out = record_out
+
+        self._last_timestamp_stream = 0.0
+        # Output stream is 4:3 (720x540, matching Deep-Live-Cam so browser stream views don't overflow)
+        self._render_height, self._render_width = int(avatar.source.shape[-2]), int(avatar.source.shape[-1])
+        self._output_width = 720
+        self._output_height = 540
+        self._camera_width = camera_width
+        self._camera_height = camera_height
+
+        self.source_image: dict[str, Any] = {"image": None, "byte_string": None, "timestamp": 0.0}
+        self._latest_raw_camera_bgr: np.ndarray | None = None
 
         self.mic_driver = MicrophoneAudioDriver(
             avatar,
             mic_device_name=mic_device_name,
             mic_index=mic_index,
         )
+        self._set_active_avatar(avatar)
         if self.mic_audio_mode:
             self.mic_driver.ensure_loaded()
             self.mic_driver.start_mic()
-
-        self._last_timestamp_stream = 0.0
-        self._output_height, self._output_width = int(avatar.source.shape[-2]), int(avatar.source.shape[-1])
-        self._camera_width = camera_width
-        self._camera_height = camera_height
 
         if camera_index is not None:
             list_webcams(device_name)
@@ -509,6 +610,74 @@ class WebcamAvatarDriver:
 
     def ping_stream(self) -> None:
         self._last_timestamp_stream = time.time()
+
+    def _set_active_avatar(self, new_avatar: Avatar) -> None:
+        """Install an Avatar in memory, recompute 4:3 crop/remap tables, and update source_image."""
+        full_box, face_box = _compute_avatar_crop_boxes(new_avatar, self.loader)
+        cyl_x, cyl_y = _build_cylindrical_remap(
+            face_box,
+            self._output_width,
+            self._output_height,
+            fov_deg=90.0,
+        )
+        src_rgb = (
+            (new_avatar.source.clamp(0.0, 1.0) * 255.0)
+            .to(torch.uint8)
+            .permute(1, 2, 0)
+            .contiguous()
+            .cpu()
+            .numpy()
+        )
+        src_4_3_rgb = _crop_to_4_3(src_rgb, full_box, self._output_width, self._output_height)
+        src_4_3_bgr = cv2.cvtColor(src_4_3_rgb, cv2.COLOR_RGB2BGR)
+
+        with self._avatar_lock:
+            self.avatar = new_avatar
+            self._full_4_3_box = full_box
+            self._face_crop_4_3_box = face_box
+            self._cyl_map_x = cyl_x
+            self._cyl_map_y = cyl_y
+            self.mic_driver.avatar = new_avatar
+            self.mic_driver.reset_state()
+            self._reference_kp = None
+            self._last_kp = None
+            self._missing_face_frames = 0
+
+        self.source_image["image"] = src_4_3_bgr
+        self.source_image["byte_string"] = write_numpy_to_byte_string(src_4_3_bgr)
+        self.source_image["timestamp"] = time.time()
+
+    def capture_source_image_from_camera(self) -> float:
+        """Capture the current webcam frame in memory and build a new target Avatar (no disk I/O)."""
+        raw_bgr = self._latest_raw_camera_bgr
+        if raw_bgr is None:
+            raise RuntimeError("No camera frame available in memory yet.")
+
+        log("Capturing camera frame in memory to replace target avatar...", "source")
+        raw_rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB)
+        ch, cw = raw_rgb.shape[:2]
+        # Scale proportionally to fit _render_height (720) and center inside _render_width (1280)
+        scale = float(self._render_height) / float(ch)
+        scaled_w = min(self._render_width, int(round(cw * scale)))
+        resized_rgb = cv2.resize(raw_rgb, (scaled_w, self._render_height), interpolation=cv2.INTER_LINEAR)
+        canvas_rgb = np.zeros((self._render_height, self._render_width, 3), dtype=np.uint8)
+        x_off = (self._render_width - scaled_w) // 2
+        canvas_rgb[:, x_off : x_off + scaled_w] = resized_rgb
+
+        new_avatar = self.loader.load_from_array(
+            canvas_rgb,
+            avatar_id="webcam_capture",
+            no_matting=False,
+        )
+        self._set_active_avatar(new_avatar)
+        log("Replaced target avatar from webcam capture in memory.", "source")
+        return float(self.source_image["timestamp"])
+
+    def restore_default_avatar(self) -> float:
+        """Restore the initial startup Avatar in memory."""
+        self._set_active_avatar(self._default_avatar)
+        log(f"Restored default avatar '{self._default_avatar.id}' in memory.", "source")
+        return float(self.source_image["timestamp"])
 
     def reset_reference(self) -> None:
         """Reset relative-motion reference frame and landmark tracker."""
@@ -558,10 +727,15 @@ class WebcamAvatarDriver:
         self.stop_camera()
 
     def _render_motion_rgb(self, motions: MotionFrame) -> np.ndarray:
+        with self._avatar_lock:
+            avatar = self.avatar
+            full_box = self._full_4_3_box
+            cyl_x = self._cyl_map_x
+            cyl_y = self._cyl_map_y
         with torch.no_grad():
             rgb_gpu, _ = render_chunk(
                 motions,
-                self.avatar,
+                avatar,
                 self.bg,
                 stitch=self.stitch,
                 warp=self.warp,
@@ -576,13 +750,24 @@ class WebcamAvatarDriver:
                 .cpu()
                 .numpy()
             )
-        return rgb_u8
+        use_face_box = self.crop_to_face and self.lipsync_only_static_head
+        if use_face_box:
+            return cv2.remap(
+                rgb_u8,
+                cyl_x,
+                cyl_y,
+                interpolation=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REPLICATE,
+            )
+        return _crop_to_4_3(rgb_u8, full_box, self._output_width, self._output_height)
 
     def _render_single_frame_rgb(self, kp: KPInfo) -> np.ndarray:
         """Run one frame through motion_stitch -> warp -> decoder -> MODNet putback and return RGB uint8."""
+        with self._avatar_lock:
+            avatar = self.avatar
         motions = _build_motion_frame(
             [kp],
-            self.avatar,
+            avatar,
             relative=self.relative,
             lipsync_only=self.lipsync_only,
             lipsync_only_static_head=self.lipsync_only_static_head,
@@ -643,13 +828,18 @@ class WebcamAvatarDriver:
                     time.sleep(0.1)
                     continue
                 camera_frame = camera_buffer.copy()
+                self._latest_raw_camera_bgr = camera_frame
                 delta_t_read = time.time() - t0
 
-                # 2. Store current camera frame
+                # 2. Store current camera frame (cropped to 4:3 aspect ratio for display)
                 t1 = time.time()
-                self.current_camera["image"] = camera_frame
+                ch, cw = camera_frame.shape[:2]
+                cam_target_w = min(cw, int(round(ch * 4.0 / 3.0)))
+                cam_x1 = (cw - cam_target_w) // 2
+                camera_4_3 = camera_frame[:, cam_x1 : cam_x1 + cam_target_w]
+                self.current_camera["image"] = camera_4_3
                 self.current_camera["timestamp"] = time.time()
-                self.current_camera["byte_string"] = write_numpy_to_byte_string(camera_frame)
+                self.current_camera["byte_string"] = write_numpy_to_byte_string(camera_4_3)
                 delta_t_copy = time.time() - t1
 
                 # 3. Extract motion from webcam frame and/or microphone audio
@@ -672,9 +862,16 @@ class WebcamAvatarDriver:
                         )
                         if kp is None:
                             self._missing_face_frames += 1
-                            if self._missing_face_frames >= 5:
-                                self._prev_lmk203 = None
-                            kp = self._last_kp if self._last_kp is not None else self.avatar.kp_info
+                            self._prev_lmk203 = None
+                            if self._missing_face_frames >= 5 or self._last_kp is None:
+                                # Return to neutral pose after 5 consecutive frames with no face
+                                kp = (
+                                    self._reference_kp
+                                    if (self.relative and self._reference_kp is not None)
+                                    else self.avatar.kp_info
+                                )
+                            else:
+                                kp = self._last_kp
                         else:
                             self._missing_face_frames = 0
                             self._last_kp = kp
@@ -713,7 +910,7 @@ class WebcamAvatarDriver:
                     delta_t_extract = 0.0
                     t3 = time.time()
                     rendered_bgr = cv2.resize(
-                        camera_frame, (self._output_width, self._output_height)
+                        camera_4_3, (self._output_width, self._output_height)
                     )
                     rendered_rgb = cv2.cvtColor(rendered_bgr, cv2.COLOR_BGR2RGB)
                     delta_t_render = time.time() - t3
@@ -811,12 +1008,53 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
   <meta charset="utf-8">
   <title>AVTR-1 Live Webcam Reenactment</title>
   <style>
-    body { background: #111; color: #eee; font-family: sans-serif; margin: 0; padding: 20px; text-align: center; }
-    .streams { display: flex; gap: 16px; justify-content: center; align-items: center; flex-wrap: wrap; }
-    .card { background: #1d1d1d; padding: 12px; border-radius: 10px; }
-    img { max-width: 46vw; max-height: 75vh; border-radius: 6px; display: block; }
-    .controls { margin-top: 16px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
-    button { padding: 10px 18px; border-radius: 6px; border: none; background: #3b82f6; color: white; font-size: 14px; cursor: pointer; }
+    * { box-sizing: border-box; }
+    ::-webkit-scrollbar { display: none; }
+    html, body {
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      margin: 0;
+      padding: 8px 12px;
+      height: 100vh;
+      width: 100vw;
+      overflow: hidden;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      align-items: center;
+    }
+    h2 { margin: 4px 0; font-size: 20px; }
+    .streams {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      align-items: center;
+      flex: 1;
+      min-height: 0;
+      width: 100%;
+    }
+    .card {
+      background: #1d1d1d;
+      padding: 8px;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      max-height: 100%;
+    }
+    img {
+      max-width: 30vw;
+      max-height: calc(100vh - 190px);
+      width: auto;
+      height: auto;
+      border-radius: 6px;
+      display: block;
+      object-fit: contain;
+    }
+    .controls { margin-top: 6px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+    button { padding: 8px 14px; border-radius: 6px; border: none; background: #3b82f6; color: white; font-size: 13px; cursor: pointer; }
     button:hover { background: #2563eb; }
     button.mode-btn.selected { background: #16a34a; font-weight: bold; }
   </style>
@@ -827,6 +1065,10 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
     <div class="card">
       <div>Rendered Avatar</div>
       <img src="/stream" alt="Rendered Stream">
+    </div>
+    <div class="card">
+      <div>Target Face (In Memory)</div>
+      <img src="/source" alt="Target Source Stream">
     </div>
     <div class="card">
       <div>Webcam Input</div>
@@ -844,7 +1086,10 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
     <button id="btn-hybrid" class="mode-btn" onclick="setMode('/hybrid_webcam_mic', 'btn-hybrid', true)">Hybrid: Webcam Head + Mic Lips</button>
   </div>
   <div class="controls">
+    <button onclick="takePicture()" style="background:#eab308;color:#111;font-weight:bold;">Take Picture (Set Target)</button>
+    <button onclick="fetch('/restore_avatar')">Restore Default Avatar</button>
     <button onclick="fetch('/reset_target')">Reset Neutral Pose</button>
+    <button id="btn-crop-face" onclick="toggleCropFace()">Crop Face (Eyebrows/lips ±1cm)</button>
     <button onclick="fetch('/active')">Active</button>
     <button onclick="fetch('/inactive')">Bypass</button>
     <button onclick="fetch('/start_camera')">Start Camera</button>
@@ -902,6 +1147,27 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
       else startBrowserMic();
     }
 
+    function updateCropBtn(active) {
+      const btn = document.getElementById('btn-crop-face');
+      if (!btn) return;
+      btn.style.background = active ? '#16a34a' : '#3b82f6';
+      btn.style.fontWeight = active ? 'bold' : 'normal';
+    }
+
+    async function toggleCropFace() {
+      const res = await fetch('/toggle_crop_face');
+      const state = await res.text();
+      updateCropBtn(state === 'crop_to_face_on');
+    }
+
+    async function takePicture() {
+      const res = await fetch('/click');
+      if (!res.ok) {
+        const msg = await res.text();
+        alert(msg);
+      }
+    }
+
     async function setMode(endpoint, btnId, needsMic = false) {
       if (needsMic && !micWs) {
         startBrowserMic();
@@ -942,6 +1208,7 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
           const pct = Math.min(100, Math.round((data.rms || 0) * 400));
           bar.style.width = pct + '%';
         }
+        updateCropBtn(Boolean(data.crop_to_face));
       } catch (e) {}
     }, 150);
     syncMode();
@@ -969,7 +1236,27 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
             "rms": driver.mic_driver.audio_rms,
             "host_mic_streaming": driver.mic_driver.mic_streaming,
             "mode": get_mode(),
+            "crop_to_face": driver.crop_to_face,
         }
+
+    @app.get("/crop_to_face_on", response_class=PlainTextResponse)
+    def crop_to_face_on() -> str:
+        driver.crop_to_face = True
+        log("Face crop (1cm above eyebrows to 1cm below lower lip) enabled.", "info")
+        return "crop_to_face_on"
+
+    @app.get("/crop_to_face_off", response_class=PlainTextResponse)
+    def crop_to_face_off() -> str:
+        driver.crop_to_face = False
+        log("Face crop disabled (full 4:3 frame).", "info")
+        return "crop_to_face_off"
+
+    @app.get("/toggle_crop_face", response_class=PlainTextResponse)
+    def toggle_crop_face() -> str:
+        driver.crop_to_face = not driver.crop_to_face
+        state = "crop_to_face_on" if driver.crop_to_face else "crop_to_face_off"
+        log(f"Toggled face crop: {state}", "info")
+        return state
 
     @app.websocket("/ws/mic")
     async def ws_mic(websocket: WebSocket) -> None:
@@ -1051,6 +1338,40 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
         log("Switched mode to: Hybrid (Webcam Head + Mic Lips)", "audio")
         return PlainTextResponse("hybrid_webcam_mic")
 
+    @app.get("/stage", response_class=HTMLResponse)
+    def stage() -> str:
+        return """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>AVTR-1 Stage Stream</title>
+  <style>
+    ::-webkit-scrollbar { display: none; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      background-color: black;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    img {
+      display: block;
+      width: auto;
+      height: 100vh;
+      max-width: 100vw;
+      object-fit: contain;
+    }
+  </style>
+</head>
+<body>
+  <img src="/stream" alt="Stage Stream">
+</body>
+</html>"""
+
     @app.get("/stream")
     def stream() -> StreamingResponse:
         return StreamingResponse(
@@ -1064,6 +1385,27 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
             _mjpeg_generator(lambda: driver.current_camera, ping=False),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
+
+    @app.get("/source")
+    def source() -> StreamingResponse:
+        return StreamingResponse(
+            _mjpeg_generator(lambda: driver.source_image, ping=False),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
+    @app.get("/click", response_class=PlainTextResponse)
+    def click() -> PlainTextResponse:
+        try:
+            ts = driver.capture_source_image_from_camera()
+            return PlainTextResponse(str(ts))
+        except Exception as exc:
+            log(f"Failed to capture target face from camera: {exc}", "error")
+            return PlainTextResponse(f"Could not capture face from camera: {exc}", status_code=400)
+
+    @app.get("/restore_avatar", response_class=PlainTextResponse)
+    def restore_avatar() -> str:
+        ts = driver.restore_default_avatar()
+        return str(ts)
 
     @app.get("/reset_target", response_class=PlainTextResponse)
     def reset_target() -> str:
@@ -1195,6 +1537,11 @@ def main() -> None:
         "--lipsync-only-static-head",
         action="store_true",
         help="Move only lips, eyelids, and eyebrows while keeping the head rotation, nose, and neck completely fixed.",
+    )
+    parser.add_argument(
+        "--crop-face",
+        action="store_true",
+        help="In static head mode, crop the 4:3 output stream to ~1cm above the eyebrows and ~1cm below the lower lip.",
     )
     parser.add_argument(
         "--mic",
@@ -1350,6 +1697,7 @@ def main() -> None:
             relative=args.relative,
             lipsync_only=args.lipsync_only,
             lipsync_only_static_head=args.lipsync_only_static_head,
+            crop_to_face=args.crop_face,
             mic_audio_mode=args.mic,
             mic_device_name=args.mic_device,
             mic_index=args.mic_index,
@@ -1402,6 +1750,8 @@ def main() -> None:
     driving_kps: list[KPInfo] = []
     prev_lmk203: np.ndarray | None = None
     last_kp: KPInfo | None = None
+    first_kp: KPInfo | None = None
+    missing_frames = 0
 
     frame_idx = 0
     t_extract0 = time.perf_counter()
@@ -1415,9 +1765,16 @@ def main() -> None:
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             kp, prev_lmk203 = _extract_driving_kp(frame_rgb, loader, prev_lmk203)
             if kp is None:
-                kp = last_kp if last_kp is not None else avatar.kp_info
+                missing_frames += 1
+                if missing_frames >= 5 or last_kp is None:
+                    kp = first_kp if (args.relative and first_kp is not None) else avatar.kp_info
+                else:
+                    kp = last_kp
             else:
+                missing_frames = 0
                 last_kp = kp
+                if first_kp is None:
+                    first_kp = kp
             driving_kps.append(kp)
             frame_idx += 1
             if frame_idx % 50 == 0:

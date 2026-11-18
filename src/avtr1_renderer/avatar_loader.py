@@ -329,10 +329,16 @@ class AvatarLoader:
 
     # ---- public ----
 
-    def load(self, portrait_path: str | Path, *, avatar_id: str) -> Avatar:
-        portrait_path = Path(portrait_path)
-
-        img, h, w = _load_image_rgb(portrait_path)
+    def load_from_array(
+        self,
+        img: np.ndarray,
+        *,
+        avatar_id: str = "webcam_capture",
+        no_matting: bool | None = None,
+        mask_hw: np.ndarray | None = None,
+    ) -> Avatar:
+        """Build an ``Avatar`` directly from an in-memory RGB(A) uint8 numpy array."""
+        h, w = img.shape[:2]
         new_h, new_w, rsz = _check_resize(h, w, self.max_dim)
         if rsz:
             img = cv2.resize(img, (new_w, new_h))
@@ -341,86 +347,51 @@ class AvatarLoader:
             img = cv2.resize(img, (self.out_w, self.out_h))
             h, w = self.out_h, self.out_w
 
-        # Auto-detect matting regime from channels:
-        # 4-ch (RGBA) → transparent portrait → MODNet needed.
-        # 3-ch (RGB)  → background baked in → skip MODNet, use source bg directly.
-        no_matting = img.shape[2] == 3
+        if no_matting is None:
+            no_matting = img.shape[2] == 3
 
         if img.shape[2] == 4:
-            # Composite the portrait over a flat grey-200 background -- the same
-            # value the reference SDK uses for its ``img_green`` matting fixture.
-            # MODNet then recovers a clean alpha matte from this; the caller
-            # composites the rendered head over any background they like.
-            #
-            # The reference uses float64 here and feeds the float64 composite
-            # directly into the face detector / landmark / crop pipeline. cv2
-            # ops accept float64 and produce slightly different numeric
-            # results than the uint8 variant; matching that behaviour matters
-            # for downstream parity.
             alpha = img[:, :, 3:] / 255.0
             rgb = img[:, :, :3]
             img_bg = rgb * alpha + 200.0 * (1.0 - alpha)
         else:
             img_bg = img.astype(np.float64)
 
-        # Run the crop cascade on the float64 composite -- same as reference.
         img_crop_512, M_c2o, _ = self._crop_512(img_bg)
 
-        # 256 crop -> appearance + motion extractors.
         rgb_256 = _img_crop_to_bchw256(img_crop_512)
         rgb_256_t = torch.from_numpy(rgb_256).cuda()
         f_s = self.appearance(AEInput(image=rgb_256_t.contiguous())).pred
         kp_info = extract_motion(rgb_256_t, motion=self.motion)
 
-        # Source frame: HWC float64 [0, 255] -> CHW float32 [0, 1].
-        # This is the grey-bg portrait composite that putback uses as the
-        # paste-target outside the face crop.
         source_t = (
             (torch.from_numpy(np.ascontiguousarray(img_bg)).cuda().float() / 255.0)
             .permute(2, 0, 1)
             .contiguous()
         )
 
-        # Per-avatar mask: look for {portrait_stem}.pbmask.png next to the portrait.
-        pbmask_path = portrait_path.parent / f"{portrait_path.stem}.pbmask.png"
-        if pbmask_path.is_file():
-            pbmask_img = cv2.imread(str(pbmask_path), cv2.IMREAD_GRAYSCALE)
-            if pbmask_img is None:
-                raise FileNotFoundError(f"Mask file found but unreadable: {pbmask_path}")
-            mask_hw = np.ascontiguousarray(pbmask_img.astype(np.float32) / 255.0)
-        else:
+        if mask_hw is None:
             mask_hw = self._default_mask_hw
 
-        # Pre-warp the mask template to the original frame using M_c2o.
         M_c2o_t = torch.from_numpy(M_c2o).cuda().to(torch.float32)
         mask_template_cuda = (
             torch.from_numpy(mask_hw).float().cuda().unsqueeze(0).unsqueeze(0)
-        )  # (1, 1, H_mask, W_mask)
+        )
         mask_warped = _kornia_warp_affine(
             mask_template_cuda, M_c2o_t, self.out_h, self.out_w
         ).clamp(0.0, 1.0)
-        # mask_warped: (1, H, W)
         mask = mask_warped.contiguous()
 
-        # Precompute the matrix ``F.affine_grid`` will consume at putback
-        # time. kornia.warp_affine builds this on every call -- the path
-        # is ``M -> M_3x3 -> normalize_homography -> torch.inverse``,
-        # where the inverse triggers a 40-kernel LU factorisation with
-        # two D2H sync points (the cuBLAS info-checks for singularity).
-        # M_c2o is constant per avatar, so we run that chain once here
-        # and cache the resulting (2, 3) tensor.
         from kornia.geometry.conversions import convert_affinematrix_to_homography
         from kornia.geometry.transform.imgwarp import normalize_homography
 
-        M_c2o_2x3 = M_c2o_t[:2, :].unsqueeze(0)  # (1, 2, 3)
-        M_3x3 = convert_affinematrix_to_homography(M_c2o_2x3)  # (1, 3, 3)
-        # The ``warp_affine`` source dim is the face crop's (H, W) = (512, 512);
-        # the dest dim is the original frame's (H, W).
+        M_c2o_2x3 = M_c2o_t[:2, :].unsqueeze(0)
+        M_3x3 = convert_affinematrix_to_homography(M_c2o_2x3)
         dst_norm_trans_src_norm = normalize_homography(
             M_3x3, (512, 512), (h, w)
-        )  # (1, 3, 3)
+        )
         src_norm_trans_dst_norm = torch.linalg.inv(dst_norm_trans_src_norm)
-        M_grid = src_norm_trans_dst_norm[:, :2, :].squeeze(0).contiguous()  # (2, 3)
+        M_grid = src_norm_trans_dst_norm[:, :2, :].squeeze(0).contiguous()
 
         return Avatar(
             id=avatar_id,
@@ -431,6 +402,20 @@ class AvatarLoader:
             source=source_t,
             no_matting=no_matting,
         )
+
+    def load(self, portrait_path: str | Path, *, avatar_id: str) -> Avatar:
+        portrait_path = Path(portrait_path)
+        img, _, _ = _load_image_rgb(portrait_path)
+
+        pbmask_path = portrait_path.parent / f"{portrait_path.stem}.pbmask.png"
+        mask_hw: np.ndarray | None = None
+        if pbmask_path.is_file():
+            pbmask_img = cv2.imread(str(pbmask_path), cv2.IMREAD_GRAYSCALE)
+            if pbmask_img is None:
+                raise FileNotFoundError(f"Mask file found but unreadable: {pbmask_path}")
+            mask_hw = np.ascontiguousarray(pbmask_img.astype(np.float32) / 255.0)
+
+        return self.load_from_array(img, avatar_id=avatar_id, mask_hw=mask_hw)
 
 
 __all__ = ["Avatar", "AvatarLoader", "CropConfig"]
