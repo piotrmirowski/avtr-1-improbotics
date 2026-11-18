@@ -23,6 +23,8 @@ Live webcam usage (inspired by Deep-Live-Cam):
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
 import threading
 import time
@@ -39,8 +41,10 @@ from avtr1_renderer.avatar_loader import Avatar, AvatarLoader, _img_crop_to_bchw
 from avtr1_renderer.avtr1_artifact_manager import (
     find_engine_or_onnx,
     get_artifact_manager,
+    get_storage_root,
     get_trt_engine_path,
 )
+from avtr1_renderer.avtr1_motion_generator import AVTR1MotionGenerator, AVTR1State, Normalizer
 from avtr1_renderer.backgrounds import load_background
 from avtr1_renderer.components.face_landmarks import landmark203
 from avtr1_renderer.components.liveportrait.motion_extractor import extract_motion
@@ -48,14 +52,21 @@ from avtr1_renderer.components.liveportrait.motion_stitch import MotionFrame
 from avtr1_renderer.components.source_crop import crop_image
 from avtr1_renderer.constants import LIPSYNC_COORDS
 from avtr1_renderer.frame_sink import pack_frames
+from avtr1_renderer.models.avtr1 import (
+    Avtr1DecodeInput,
+    Avtr1DecodeOutput,
+    Avtr1EncodeInput,
+    Avtr1EncodeOutput,
+)
 from avtr1_renderer.models.decoder import DecoderEngine, DecoderInput, DecoderOutput
+from avtr1_renderer.models.hubert import HubertInput, HubertOutput
 from avtr1_renderer.models.matting import MODNetEngine, MODNetInput, MODNetOutput
 from avtr1_renderer.models.stitch import StitchEngine, StitchInput, StitchOutput
 from avtr1_renderer.models.warp import WarpEngine, WarpInput, WarpOutput
 from avtr1_renderer.pipeline import TRANSPARENT_BG_ID
 from avtr1_renderer.renderer import render_chunk, render_chunk_streaming
 from avtr1_renderer.runtime import load_engine
-from avtr1_renderer.types import KPInfo
+from avtr1_renderer.types import Chunk, KPInfo
 
 _LIPSYNC_INDEX = list(LIPSYNC_COORDS)
 _LM203_DSIZE = 224
@@ -214,8 +225,196 @@ def _build_motion_frame(
     )
 
 
+def list_microphones(device_name: str = "") -> int | None:
+    """Enumerate audio input devices via sounddevice and return matching device index."""
+    try:
+        import sounddevice as sd
+
+        matched: list[int] = []
+        for idx, dev in enumerate(sd.query_devices()):
+            if dev.get("max_input_channels", 0) > 0:
+                name = str(dev.get("name", f"Device {idx}"))
+                print(f"[mic] {idx}: {name}")
+                if device_name and device_name.lower() in name.lower():
+                    matched.append(idx)
+        return min(matched) if matched else None
+    except ImportError:
+        log("sounddevice not installed; host mic capture unavailable (browser mic via Web UI still works).", "warning")
+        return None
+    except Exception as exc:
+        log(f"Could not enumerate microphones: {exc}", "warning")
+        return None
+
+
 # ---------------------------------------------------------------------------
-# Live Webcam Driver (threaded loop inspired by Deep-Live-Cam deep_fake.py)
+# Complementary Live Microphone Audio Driver (AVTR-1 speech-to-motion)
+# ---------------------------------------------------------------------------
+
+_SAMPLE_RATE = 16_000
+
+
+class MicrophoneAudioDriver:
+    """Captures 16 kHz mono microphone audio and drives AVTR1MotionGenerator."""
+
+    def __init__(
+        self,
+        avatar: Avatar,
+        *,
+        mic_device_name: str = "",
+        mic_index: int | None = None,
+    ) -> None:
+        self.avatar = avatar
+        self.mic_device_name = mic_device_name
+        self.mic_index = mic_index
+
+        self._motion_generator: AVTR1MotionGenerator | None = None
+        self._state: AVTR1State | None = None
+        self._pending_frames: list[MotionFrame] = []
+
+        self._lock = threading.Lock()
+        # 3200 samples = 200 ms step (5 frames @ 25 fps); 6480 samples = full HuBERT window
+        self._step_samples = 3200
+        self._window_samples = 6480
+        self._ring = np.zeros(self._window_samples, dtype=np.float32)
+        self.audio_rms: float = 0.0
+
+        self._sd_stream: Any = None
+        self.mic_streaming: bool = False
+
+    def ensure_loaded(self) -> None:
+        """Lazily load HuBERT + AVTR-1 encode/decode TRT engines when audio mode is activated."""
+        if self._motion_generator is not None:
+            return
+        encode_path = get_trt_engine_path("avtr1_encode")
+        decode_path = get_trt_engine_path("avtr1_decode")
+        norm_path = get_storage_root() / "avtr1_normalizer.safetensors"
+        if not encode_path.is_file() or not decode_path.is_file() or not norm_path.is_file():
+            raise RuntimeError(
+                "AVTR-1 audio TRT engines not found. Run `pixi run build-trt-engines-avtr1` "
+                "(and `pixi run build-trt-engines-hubert`) first."
+            )
+        log("Loading AVTR-1 audio-to-motion engines (HuBERT + encode + decode)...", "audio")
+        encode = load_engine(encode_path, Avtr1EncodeInput, Avtr1EncodeOutput)
+        decode = load_engine(decode_path, Avtr1DecodeInput, Avtr1DecodeOutput)
+        normalizer = Normalizer.from_safetensors(norm_path)
+        hubert = load_engine(
+            find_engine_or_onnx("hubert_lbs", "hubert_onnx"),
+            HubertInput,
+            HubertOutput,
+        )
+        self._motion_generator = AVTR1MotionGenerator(
+            hubert=hubert,
+            encode_engine=encode,
+            decode_engine=decode,
+            normalizer=normalizer,
+        )
+        self._step_samples = self._motion_generator.chunk_size * self._motion_generator.frame_len
+        self._window_samples = (
+            (self._motion_generator.chunk_size + self._motion_generator.future_size)
+            * self._motion_generator.frame_len
+            + self._motion_generator.audio_shift
+        )
+        with self._lock:
+            self._ring = np.zeros(self._window_samples, dtype=np.float32)
+        self._state = self._motion_generator.initial_state(self.avatar)
+        log("AVTR-1 audio-to-motion generator ready.", "audio")
+
+    def start_mic(self) -> None:
+        """Start host microphone capture via sounddevice (if installed)."""
+        if self.mic_streaming:
+            return
+        try:
+            import sounddevice as sd
+
+            dev = (
+                self.mic_index
+                if self.mic_index is not None
+                else list_microphones(self.mic_device_name)
+            )
+
+            def _callback(indata: np.ndarray, _frames: int, _time_info: Any, status: Any) -> None:
+                if status:
+                    pass
+                mono = indata[:, 0].astype(np.float32, copy=True)
+                self.push_audio_samples(mono)
+
+            self._sd_stream = sd.InputStream(
+                samplerate=_SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                blocksize=1600,
+                device=dev,
+                callback=_callback,
+            )
+            self._sd_stream.start()
+            self.mic_streaming = True
+            log(f"Started host microphone stream (device={dev}).", "audio")
+        except Exception as exc:
+            log(f"Host microphone stream not started ({exc}); you can use Browser Mic in the UI.", "warning")
+
+    def stop_mic(self) -> None:
+        if self._sd_stream is not None:
+            try:
+                self._sd_stream.stop()
+                self._sd_stream.close()
+            except Exception:
+                pass
+            self._sd_stream = None
+        self.mic_streaming = False
+
+    def push_audio_samples(self, samples_16k: np.ndarray) -> None:
+        """Append 16 kHz mono float32 samples into the rolling audio buffer."""
+        if samples_16k.size == 0:
+            return
+        samples_16k = np.asarray(samples_16k, dtype=np.float32).reshape(-1)
+        rms = float(np.sqrt(np.mean(samples_16k * samples_16k)))
+        self.audio_rms = 0.7 * self.audio_rms + 0.3 * rms
+        with self._lock:
+            n = len(samples_16k)
+            if n >= self._step_samples:
+                # Keep the latest _step_samples in the current slot, zero future lookahead for low latency
+                self._ring[: self._step_samples] = samples_16k[-self._step_samples :]
+                self._ring[self._step_samples :] = 0.0
+            else:
+                self._ring[: self._step_samples - n] = self._ring[n : self._step_samples]
+                self._ring[self._step_samples - n : self._step_samples] = samples_16k
+                self._ring[self._step_samples :] = 0.0
+
+    def reset_state(self) -> None:
+        if self._motion_generator is not None:
+            self._state = self._motion_generator.initial_state(self.avatar)
+        self._pending_frames.clear()
+
+    def next_motion_frame(self, *, static_head: bool = False) -> MotionFrame:
+        """Return the next single-frame MotionFrame predicted from live microphone audio."""
+        self.ensure_loaded()
+        assert self._motion_generator is not None
+        if self._state is None:
+            self._state = self._motion_generator.initial_state(self.avatar)
+
+        if not self._pending_frames:
+            with self._lock:
+                speech_win = self._ring.copy()
+            listen_win = np.zeros_like(speech_win)
+            chunk = Chunk(audio_speech=speech_win, audio_listen=listen_win)
+            motions_5, self._state = self._motion_generator.generate_chunk(
+                chunk, self.avatar, self._state
+            )
+            self._pending_frames = [motions_5[i] for i in range(len(motions_5))]
+
+        frame_motion = self._pending_frames.pop(0)
+        if static_head:
+            R_s = self.avatar.kp_info.R
+            return MotionFrame(
+                R=R_s.clone(),
+                exp=frame_motion.exp,
+                lock_static_kps=True,
+            )
+        return frame_motion
+
+
+# ---------------------------------------------------------------------------
+# Live Webcam + Microphone Driver (threaded loop inspired by Deep-Live-Cam)
 # ---------------------------------------------------------------------------
 
 
@@ -239,6 +438,9 @@ class WebcamAvatarDriver:
         relative: bool = True,
         lipsync_only: bool = False,
         lipsync_only_static_head: bool = False,
+        mic_audio_mode: bool = False,
+        mic_device_name: str = "",
+        mic_index: int | None = None,
         use_virtual_cam: bool = True,
         record_out: Path | None = None,
     ) -> None:
@@ -253,8 +455,19 @@ class WebcamAvatarDriver:
         self.relative = relative
         self.lipsync_only = lipsync_only
         self.lipsync_only_static_head = lipsync_only_static_head
+        self.mic_audio_mode = mic_audio_mode
+        self.hybrid_webcam_mic = False
         self.use_virtual_cam = use_virtual_cam
         self.record_out = record_out
+
+        self.mic_driver = MicrophoneAudioDriver(
+            avatar,
+            mic_device_name=mic_device_name,
+            mic_index=mic_index,
+        )
+        if self.mic_audio_mode:
+            self.mic_driver.ensure_loaded()
+            self.mic_driver.start_mic()
 
         self._last_timestamp_stream = 0.0
         self._output_height, self._output_width = int(avatar.source.shape[-2]), int(avatar.source.shape[-1])
@@ -341,18 +554,10 @@ class WebcamAvatarDriver:
 
     def stop(self) -> None:
         self._running = False
+        self.mic_driver.stop_mic()
         self.stop_camera()
 
-    def _render_single_frame_rgb(self, kp: KPInfo) -> np.ndarray:
-        """Run one frame through motion_stitch -> warp -> decoder -> MODNet putback and return RGB uint8."""
-        motions = _build_motion_frame(
-            [kp],
-            self.avatar,
-            relative=self.relative,
-            lipsync_only=self.lipsync_only,
-            lipsync_only_static_head=self.lipsync_only_static_head,
-            reference_kp=self._reference_kp,
-        )
+    def _render_motion_rgb(self, motions: MotionFrame) -> np.ndarray:
         with torch.no_grad():
             rgb_gpu, _ = render_chunk(
                 motions,
@@ -372,6 +577,18 @@ class WebcamAvatarDriver:
                 .numpy()
             )
         return rgb_u8
+
+    def _render_single_frame_rgb(self, kp: KPInfo) -> np.ndarray:
+        """Run one frame through motion_stitch -> warp -> decoder -> MODNet putback and return RGB uint8."""
+        motions = _build_motion_frame(
+            [kp],
+            self.avatar,
+            relative=self.relative,
+            lipsync_only=self.lipsync_only,
+            lipsync_only_static_head=self.lipsync_only_static_head,
+            reference_kp=self._reference_kp,
+        )
+        return self._render_motion_rgb(motions)
 
     def _run_deep_fake_loop(self) -> None:
         """Background thread loop that reads the camera, extracts motion, and renders the avatar."""
@@ -435,30 +652,63 @@ class WebcamAvatarDriver:
                 self.current_camera["byte_string"] = write_numpy_to_byte_string(camera_frame)
                 delta_t_copy = time.time() - t1
 
-                # 3. Extract motion from webcam frame
+                # 3. Extract motion from webcam frame and/or microphone audio
                 t2 = time.time()
                 frame_rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
                 if self.current_deepfake["active"]:
-                    kp, self._prev_lmk203 = _extract_driving_kp(
-                        frame_rgb, self.loader, self._prev_lmk203
-                    )
-                    if kp is None:
-                        self._missing_face_frames += 1
-                        if self._missing_face_frames >= 5:
-                            self._prev_lmk203 = None
-                        kp = self._last_kp if self._last_kp is not None else self.avatar.kp_info
+                    if self.mic_audio_mode and not self.hybrid_webcam_mic:
+                        # Pure microphone audio-driven mode (AVTR-1)
+                        audio_motion = self.mic_driver.next_motion_frame(
+                            static_head=self.lipsync_only_static_head
+                        )
+                        delta_t_extract = time.time() - t2
+                        t3 = time.time()
+                        rendered_rgb = self._render_motion_rgb(audio_motion)
+                        rendered_bgr = cv2.cvtColor(rendered_rgb, cv2.COLOR_RGB2BGR)
+                        delta_t_render = time.time() - t3
                     else:
-                        self._missing_face_frames = 0
-                        self._last_kp = kp
-                        if self._reference_kp is None:
-                            self._reference_kp = kp
-                    delta_t_extract = time.time() - t2
+                        kp, self._prev_lmk203 = _extract_driving_kp(
+                            frame_rgb, self.loader, self._prev_lmk203
+                        )
+                        if kp is None:
+                            self._missing_face_frames += 1
+                            if self._missing_face_frames >= 5:
+                                self._prev_lmk203 = None
+                            kp = self._last_kp if self._last_kp is not None else self.avatar.kp_info
+                        else:
+                            self._missing_face_frames = 0
+                            self._last_kp = kp
+                            if self._reference_kp is None:
+                                self._reference_kp = kp
 
-                    # 4. Render avatar frame on GPU
-                    t3 = time.time()
-                    rendered_rgb = self._render_single_frame_rgb(kp)
-                    rendered_bgr = cv2.cvtColor(rendered_rgb, cv2.COLOR_RGB2BGR)
-                    delta_t_render = time.time() - t3
+                        if self.hybrid_webcam_mic:
+                            # Hybrid mode: head rotation from webcam + lips/expression from mic audio
+                            cam_motion = _build_motion_frame(
+                                [kp],
+                                self.avatar,
+                                relative=self.relative,
+                                lipsync_only=False,
+                                lipsync_only_static_head=False,
+                                reference_kp=self._reference_kp,
+                            )
+                            audio_motion = self.mic_driver.next_motion_frame(static_head=False)
+                            hybrid_motion = MotionFrame(
+                                R=cam_motion.R,
+                                exp=audio_motion.exp,
+                                lock_static_kps=False,
+                            )
+                            delta_t_extract = time.time() - t2
+                            t3 = time.time()
+                            rendered_rgb = self._render_motion_rgb(hybrid_motion)
+                            rendered_bgr = cv2.cvtColor(rendered_rgb, cv2.COLOR_RGB2BGR)
+                            delta_t_render = time.time() - t3
+                        else:
+                            delta_t_extract = time.time() - t2
+                            # 4. Render avatar frame on GPU
+                            t3 = time.time()
+                            rendered_rgb = self._render_single_frame_rgb(kp)
+                            rendered_bgr = cv2.cvtColor(rendered_rgb, cv2.COLOR_RGB2BGR)
+                            delta_t_render = time.time() - t3
                 else:
                     delta_t_extract = 0.0
                     t3 = time.time()
@@ -522,8 +772,8 @@ class WebcamAvatarDriver:
 
 def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
     """Serve live MJPEG streams (/stream, /camera) and control endpoints via FastAPI/uvicorn."""
-    from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
     import uvicorn
 
     app = FastAPI()
@@ -531,7 +781,7 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
     def _mjpeg_generator(slot_getter, ping: bool = False):
         latest_bytes: bytes | None = None
         latest_ts = 0.0
-        while True:
+        while driver._running:
             slot = slot_getter()
             if latest_ts < slot["timestamp"]:
                 latest_ts = slot["timestamp"]
@@ -584,9 +834,14 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
     </div>
   </div>
   <div class="controls">
-    <button id="btn-free" class="mode-btn" onclick="setMode('/free_head', 'btn-free')">Free Head Movement</button>
-    <button id="btn-lipsync" class="mode-btn" onclick="setMode('/lipsync_only', 'btn-lipsync')">Lipsync + Head Pose</button>
-    <button id="btn-static" class="mode-btn" onclick="setMode('/lipsync_only_static_head', 'btn-static')">Lipsync Only (Static Head)</button>
+    <button id="btn-free" class="mode-btn" onclick="setMode('/free_head', 'btn-free')">Webcam: Free Head Movement</button>
+    <button id="btn-lipsync" class="mode-btn" onclick="setMode('/lipsync_only', 'btn-lipsync')">Webcam: Lipsync + Head Pose</button>
+    <button id="btn-static" class="mode-btn" onclick="setMode('/lipsync_only_static_head', 'btn-static')">Webcam: Lipsync Only (Static Head)</button>
+  </div>
+  <div class="controls">
+    <button id="btn-mic" class="mode-btn" onclick="setMode('/mic_audio', 'btn-mic', true)">Mic Audio (AVTR-1)</button>
+    <button id="btn-mic-static" class="mode-btn" onclick="setMode('/mic_audio_static_head', 'btn-mic-static', true)">Mic Audio (Static Head)</button>
+    <button id="btn-hybrid" class="mode-btn" onclick="setMode('/hybrid_webcam_mic', 'btn-hybrid', true)">Hybrid: Webcam Head + Mic Lips</button>
   </div>
   <div class="controls">
     <button onclick="fetch('/reset_target')">Reset Neutral Pose</button>
@@ -594,10 +849,69 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
     <button onclick="fetch('/inactive')">Bypass</button>
     <button onclick="fetch('/start_camera')">Start Camera</button>
     <button onclick="fetch('/stop_camera')">Stop Camera</button>
+    <button id="btn-browser-mic" onclick="toggleBrowserMic()">Enable Browser Mic</button>
+    <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;color:#aaa;">
+      Mic Level:
+      <span style="width:90px;height:10px;background:#333;border-radius:5px;overflow:hidden;display:inline-block;">
+        <span id="mic-bar" style="display:block;height:100%;width:0%;background:#22c55e;transition:width 0.08s;"></span>
+      </span>
+    </span>
   </div>
   <script>
-    async function setMode(endpoint, btnId) {
-      await fetch(endpoint);
+    let micWs = null;
+    let audioCtx = null;
+    let micStream = null;
+    let scriptNode = null;
+
+    async function startBrowserMic() {
+      if (micWs) return;
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, sampleRate: 16000 } });
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        const source = audioCtx.createMediaStreamSource(micStream);
+        scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        micWs = new WebSocket(proto + '//' + location.host + '/ws/mic');
+        micWs.binaryType = 'arraybuffer';
+        scriptNode.onaudioprocess = (e) => {
+          if (micWs && micWs.readyState === WebSocket.OPEN) {
+            const input = e.inputBuffer.getChannelData(0);
+            micWs.send(input.buffer.slice(0));
+          }
+        };
+        source.connect(scriptNode);
+        scriptNode.connect(audioCtx.destination);
+        const btn = document.getElementById('btn-browser-mic');
+        if (btn) { btn.textContent = 'Disable Browser Mic'; btn.style.background = '#dc2626'; }
+      } catch (err) {
+        console.warn('Browser mic not started:', err);
+      }
+    }
+
+    function stopBrowserMic() {
+      if (scriptNode) { scriptNode.disconnect(); scriptNode = null; }
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+      if (micWs) { micWs.close(); micWs = null; }
+      const btn = document.getElementById('btn-browser-mic');
+      if (btn) { btn.textContent = 'Enable Browser Mic'; btn.style.background = '#3b82f6'; }
+    }
+
+    function toggleBrowserMic() {
+      if (micWs) stopBrowserMic();
+      else startBrowserMic();
+    }
+
+    async function setMode(endpoint, btnId, needsMic = false) {
+      if (needsMic && !micWs) {
+        startBrowserMic();
+      }
+      const res = await fetch(endpoint);
+      if (!res.ok) {
+        const msg = await res.text();
+        alert(msg);
+        return;
+      }
       document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('selected'));
       const el = document.getElementById(btnId);
       if (el) el.classList.add('selected');
@@ -610,12 +924,26 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
         const map = {
           'free_head': 'btn-free',
           'lipsync_only': 'btn-lipsync',
-          'lipsync_only_static_head': 'btn-static'
+          'lipsync_only_static_head': 'btn-static',
+          'mic_audio': 'btn-mic',
+          'mic_audio_static_head': 'btn-mic-static',
+          'hybrid_webcam_mic': 'btn-hybrid'
         };
         const el = document.getElementById(map[mode]);
         if (el) el.classList.add('selected');
       } catch (e) {}
     }
+    setInterval(async () => {
+      try {
+        const r = await fetch('/mic_status');
+        const data = await r.json();
+        const bar = document.getElementById('mic-bar');
+        if (bar) {
+          const pct = Math.min(100, Math.round((data.rms || 0) * 400));
+          bar.style.width = pct + '%';
+        }
+      } catch (e) {}
+    }, 150);
     syncMode();
   </script>
 </body>
@@ -623,32 +951,105 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
 
     @app.get("/mode", response_class=PlainTextResponse)
     def get_mode() -> str:
+        if driver.hybrid_webcam_mic:
+            return "hybrid_webcam_mic"
+        if driver.mic_audio_mode:
+            if driver.lipsync_only_static_head:
+                return "mic_audio_static_head"
+            return "mic_audio"
         if driver.lipsync_only_static_head:
             return "lipsync_only_static_head"
         if driver.lipsync_only:
             return "lipsync_only"
         return "free_head"
 
+    @app.get("/mic_status", response_class=JSONResponse)
+    def mic_status() -> dict[str, Any]:
+        return {
+            "rms": driver.mic_driver.audio_rms,
+            "host_mic_streaming": driver.mic_driver.mic_streaming,
+            "mode": get_mode(),
+        }
+
+    @app.websocket("/ws/mic")
+    async def ws_mic(websocket: WebSocket) -> None:
+        await websocket.accept()
+        try:
+            while True:
+                raw = await websocket.receive_bytes()
+                samples = np.frombuffer(raw, dtype=np.float32)
+                driver.mic_driver.push_audio_samples(samples)
+        except WebSocketDisconnect:
+            pass
+
     @app.get("/free_head", response_class=PlainTextResponse)
     def free_head() -> str:
+        driver.mic_audio_mode = False
+        driver.hybrid_webcam_mic = False
         driver.lipsync_only = False
         driver.lipsync_only_static_head = False
-        log("Switched mode to: Free Head Movement", "info")
+        log("Switched mode to: Webcam Free Head Movement", "info")
         return "free_head"
 
     @app.get("/lipsync_only", response_class=PlainTextResponse)
     def lipsync_only() -> str:
+        driver.mic_audio_mode = False
+        driver.hybrid_webcam_mic = False
         driver.lipsync_only = True
         driver.lipsync_only_static_head = False
-        log("Switched mode to: Lipsync + Head Pose", "info")
+        log("Switched mode to: Webcam Lipsync + Head Pose", "info")
         return "lipsync_only"
 
     @app.get("/lipsync_only_static_head", response_class=PlainTextResponse)
     def lipsync_only_static_head() -> str:
+        driver.mic_audio_mode = False
+        driver.hybrid_webcam_mic = False
         driver.lipsync_only = False
         driver.lipsync_only_static_head = True
-        log("Switched mode to: Lipsync Only (Static Head)", "info")
+        log("Switched mode to: Webcam Lipsync Only (Static Head)", "info")
         return "lipsync_only_static_head"
+
+    @app.get("/mic_audio", response_class=PlainTextResponse)
+    def mic_audio() -> PlainTextResponse:
+        try:
+            driver.mic_driver.ensure_loaded()
+            driver.mic_driver.start_mic()
+        except Exception as exc:
+            return PlainTextResponse(str(exc), status_code=400)
+        driver.mic_audio_mode = True
+        driver.hybrid_webcam_mic = False
+        driver.lipsync_only = False
+        driver.lipsync_only_static_head = False
+        log("Switched mode to: Mic Audio (AVTR-1)", "audio")
+        return PlainTextResponse("mic_audio")
+
+    @app.get("/mic_audio_static_head", response_class=PlainTextResponse)
+    def mic_audio_static_head() -> PlainTextResponse:
+        try:
+            driver.mic_driver.ensure_loaded()
+            driver.mic_driver.start_mic()
+        except Exception as exc:
+            return PlainTextResponse(str(exc), status_code=400)
+        driver.mic_audio_mode = True
+        driver.hybrid_webcam_mic = False
+        driver.lipsync_only = False
+        driver.lipsync_only_static_head = True
+        log("Switched mode to: Mic Audio (Static Head)", "audio")
+        return PlainTextResponse("mic_audio_static_head")
+
+    @app.get("/hybrid_webcam_mic", response_class=PlainTextResponse)
+    def hybrid_webcam_mic() -> PlainTextResponse:
+        try:
+            driver.mic_driver.ensure_loaded()
+            driver.mic_driver.start_mic()
+        except Exception as exc:
+            return PlainTextResponse(str(exc), status_code=400)
+        driver.mic_audio_mode = True
+        driver.hybrid_webcam_mic = True
+        driver.lipsync_only = False
+        driver.lipsync_only_static_head = False
+        log("Switched mode to: Hybrid (Webcam Head + Mic Lips)", "audio")
+        return PlainTextResponse("hybrid_webcam_mic")
 
     @app.get("/stream")
     def stream() -> StreamingResponse:
@@ -689,8 +1090,18 @@ def _run_webcam_server(driver: WebcamAvatarDriver, port: int) -> None:
         driver.stop_camera()
         return "camera_stopped"
 
-    print(f"\n[webcam] Live preview server running at http://127.0.0.1:{port}/ (and /stream)")
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    print(f"\n[webcam] Live preview server running at http://127.0.0.1:{port}/ (and /stream). Press Ctrl+C to stop.")
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+
+    server_thread = threading.Thread(target=server.run, daemon=True)
+    server_thread.start()
+
+    while driver._running and server_thread.is_alive():
+        time.sleep(0.1)
+    server.should_exit = True
+    server.force_exit = True
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +1197,23 @@ def main() -> None:
         help="Move only lips, eyelids, and eyebrows while keeping the head rotation, nose, and neck completely fixed.",
     )
     parser.add_argument(
+        "--mic",
+        action="store_true",
+        help="Start in live microphone audio-driven mode (AVTR-1).",
+    )
+    parser.add_argument(
+        "--mic-device",
+        type=str,
+        default="",
+        help="Microphone device name substring to match (optional).",
+    )
+    parser.add_argument(
+        "--mic-index",
+        type=int,
+        default=None,
+        help="Explicit microphone device index (optional).",
+    )
+    parser.add_argument(
         "--max-frames",
         type=int,
         default=None,
@@ -805,7 +1233,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    use_webcam = args.webcam or (args.driving is None and args.camera_index is not None)
+    use_webcam = args.webcam or args.mic or (args.driving is None and args.camera_index is not None)
     if not use_webcam and args.driving is None:
         parser.error("Provide either --driving <video_path> or --webcam (or --camera-index).")
     if not use_webcam and not args.driving.is_file():
@@ -922,20 +1350,38 @@ def main() -> None:
             relative=args.relative,
             lipsync_only=args.lipsync_only,
             lipsync_only_static_head=args.lipsync_only_static_head,
+            mic_audio_mode=args.mic,
+            mic_device_name=args.mic_device,
+            mic_index=args.mic_index,
             use_virtual_cam=args.virtual_cam,
             record_out=args.out,
         )
+
+        def _handle_sigint(_signum: int, _frame: object) -> None:
+            print()
+            log("Ctrl+C pressed. Exiting...", "info")
+            driver.stop()
+            if driver._thread is not None and driver._thread.is_alive():
+                driver._thread.join(timeout=1.5)
+            os._exit(0)
+
+        signal.signal(signal.SIGINT, _handle_sigint)
+        signal.signal(signal.SIGTERM, _handle_sigint)
+
         try:
             if args.port > 0:
                 _run_webcam_server(driver, args.port)
             else:
-                while True:
-                    time.sleep(0.5)
+                while driver._running:
+                    time.sleep(0.1)
         except KeyboardInterrupt:
             print()
             log("Ctrl+C pressed. Exiting...", "info")
         finally:
             driver.stop()
+            if driver._thread is not None and driver._thread.is_alive():
+                driver._thread.join(timeout=1.5)
+            os._exit(0)
         return
 
     # ---- Offline Video Mode -------------------------------------------------
