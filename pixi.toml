@@ -60,6 +60,9 @@ httpx = ">=0.28,<0.29"
 fastapi = ">=0.116,<0.117"
 uvicorn = ">=0.35,<0.36"
 python-multipart = ">=0.0.20,<0.0.21"
+cv2-enumerate-cameras = ">=1.1.15"
+pyvirtualcam = ">=0.11.0"
+sounddevice = ">=0.5.0"
 
 # Build-time only (needed when compiling TRT engines with scripts/build_*.py)
 [feature.build.tasks]
