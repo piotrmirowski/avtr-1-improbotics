@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,8 +53,9 @@ def _start_renderer(port: int) -> subprocess.Popen[bytes]:
     # set it via uvicorn here by invoking app:app directly with --port.
     # Disable the LB keep-alive worker -- there is no LB in the local setup.
     env.setdefault("LOAD_BALANCER_URL", "disabled")
+    pixi_bin = shutil.which("pixi") or "pixi"
     cmd = [
-        "pixi", "run", "-e", "default",
+        pixi_bin, "run", "-e", "default",
         "python", "-m", "uvicorn",
         "avtr1_renderer.api.app:app",
         "--host", "0.0.0.0",

@@ -17,6 +17,10 @@ Quickstart::
             yield frame  # 25 fps YUV frames
 """
 
+import os
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from avtr1_renderer.avatar_loader import Avatar
 from avtr1_renderer.pipeline import Pipeline
 from avtr1_renderer.types import Chunk, Frame, FrameIterator, RenderOptions

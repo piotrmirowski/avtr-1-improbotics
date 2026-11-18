@@ -36,6 +36,8 @@ from avtr1_renderer.models.stitch import StitchEngine, StitchInput
 from avtr1_renderer.types import KPInfo
 
 _LIPSYNC_INDEX = list(LIPSYNC_COORDS)
+_MOVING_KP_SET = frozenset(c // 3 for c in LIPSYNC_COORDS)
+_STATIC_KP_INDEX = [i for i in range(21) if i not in _MOVING_KP_SET]
 
 
 @dataclass(slots=True, frozen=True)
@@ -68,20 +70,33 @@ class MotionFrame:
 
     R: torch.Tensor  # (N, 3, 3) rotation matrices
     exp: torch.Tensor  # (N, len(LIPSYNC_COORDS)) lipsync expression deltas
+    lock_static_kps: bool = False  # pin nose/head/neck keypoints to source x_s
 
     def __len__(self) -> int:
         return self.R.shape[0]
 
     def __iter__(self) -> Iterator[MotionFrame]:
         for i in range(self.R.shape[0]):
-            yield MotionFrame(R=self.R[i : i + 1], exp=self.exp[i : i + 1])
+            yield MotionFrame(
+                R=self.R[i : i + 1],
+                exp=self.exp[i : i + 1],
+                lock_static_kps=self.lock_static_kps,
+            )
 
     def __getitem__(self, idx: int | slice) -> MotionFrame:
         if isinstance(idx, int):
             if idx < 0:
                 idx += self.R.shape[0]
-            return MotionFrame(R=self.R[idx : idx + 1], exp=self.exp[idx : idx + 1])
-        return MotionFrame(R=self.R[idx], exp=self.exp[idx])
+            return MotionFrame(
+                R=self.R[idx : idx + 1],
+                exp=self.exp[idx : idx + 1],
+                lock_static_kps=self.lock_static_kps,
+            )
+        return MotionFrame(
+            R=self.R[idx],
+            exp=self.exp[idx],
+            lock_static_kps=self.lock_static_kps,
+        )
 
 
 def _transform_source(kp_info: KPInfo) -> torch.Tensor:
@@ -101,18 +116,18 @@ def _transform_source(kp_info: KPInfo) -> torch.Tensor:
 
 
 def _build_x_d_delta(motion: MotionFrame, kp_info: KPInfo) -> torch.Tensor:
-    """Splice predicted lipsync coords into the source's full expression.
+    """Splice predicted lipsync coords into the source's full expression,
+    or pass through a full 21x3 driving expression delta.
 
     Batched along the frame dim: ``motion`` carries ``N >= 1`` frames, the
-    output is ``(N, 21, 3)``. Mirrors the reference's
-    ``delta_new[:, LIPSYNC_COORDS] = motion.exp`` per frame -- and yes,
-    ``LIPSYNC_COORDS`` contains a duplicate (54 appears at index 30 and
-    32) so the second write wins for that slot. The duplicate-write is
-    nondeterministic on CUDA (and stays nondeterministic in batched form,
-    independently per row), which is why parity tests mask out keypoint
-    18 (= flat index 54).
+    output is ``(N, 21, 3)``. When ``motion.exp`` is a full ``(N, 21, 3)`` or
+    ``(N, 63)`` tensor (e.g. from video-driven motion extraction), it is used
+    directly. Otherwise ``motion.exp`` has ``len(LIPSYNC_COORDS)`` columns and
+    is spliced into ``kp_info.exp``.
     """
     n = motion.R.shape[0]
+    if motion.exp.shape[-2:] == (21, 3) or motion.exp.shape[-1] == 63:
+        return motion.exp.reshape(n, 21, 3)
     delta = kp_info.exp.flatten(1).expand(n, -1).clone()  # (N, 63)
     delta[:, _LIPSYNC_INDEX] = motion.exp
     return delta.view(n, 21, 3)
@@ -180,6 +195,9 @@ def motion_stitch(
     x_d = stitch(
         StitchInput(kp_source=x_s_b, kp_driving=x_d_raw.contiguous())
     ).out
+    if motions.lock_static_kps:
+        x_d = x_d.clone()
+        x_d[:, _STATIC_KP_INDEX, :] = x_s_b[:, _STATIC_KP_INDEX, :]
     return x_s, x_d
 
 

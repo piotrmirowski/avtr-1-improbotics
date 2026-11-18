@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import io
 import sys
 import time
 from pathlib import Path
@@ -40,8 +41,9 @@ import numpy as np
 import onnx
 import onnx.shape_inference
 import onnx_graphsurgeon as gs
-import tensorrt as trt
 import torch
+import torch.nn as nn
+import tensorrt as trt
 from onnx.tools.update_model_dims import update_inputs_outputs_dims
 
 # ONNX sources are downloaded from HuggingFace via the build artifact manager.
@@ -371,10 +373,149 @@ def _surge_warp(graph: gs.Graph) -> None:
     )
 
 
+class _GridSample3DModule(nn.Module):
+    """Pure-ONNX 5D trilinear GridSample (align_corners=False, padding_mode='zeros').
+
+    TensorRT's built-in ``INetworkDefinition::addGridSample`` only supports 4D
+    (2D spatial) inputs. When building ``warp_network_ori.onnx`` without the
+    Linux-only ``libgrid_sample_3d_plugin.so`` custom plugin, we decompose the
+    two 5D ``GridSample`` nodes into standard ONNX elementwise + ``GatherElements``
+    ops that TensorRT compiles natively.
+    """
+
+    def __init__(self, c: int, d: int = 16, h: int = 64, w: int = 64) -> None:
+        super().__init__()
+        self.c = c
+        self.d = d
+        self.h = h
+        self.w = w
+
+    def forward(self, x: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+        D, H, W = self.d, self.h, self.w
+        HW = H * W
+        DHW = D * HW
+
+        gx = grid[..., 0]
+        gy = grid[..., 1]
+        gz = grid[..., 2]
+
+        ix = (gx + 1.0) * (W * 0.5) - 0.5
+        iy = (gy + 1.0) * (H * 0.5) - 0.5
+        iz = (gz + 1.0) * (D * 0.5) - 0.5
+
+        x0 = torch.floor(ix)
+        y0 = torch.floor(iy)
+        z0 = torch.floor(iz)
+
+        x1 = x0 + 1.0
+        y1 = y0 + 1.0
+        z1 = z0 + 1.0
+
+        wx1 = ix - x0
+        wy1 = iy - y0
+        wz1 = iz - z0
+        wx0 = 1.0 - wx1
+        wy0 = 1.0 - wy1
+        wz0 = 1.0 - wz1
+
+        zero = torch.zeros((), dtype=x.dtype, device=x.device)
+        wx0 = torch.where((x0 >= 0.0) & (x0 < float(W)), wx0, zero)
+        wx1 = torch.where((x1 >= 0.0) & (x1 < float(W)), wx1, zero)
+        wy0 = torch.where((y0 >= 0.0) & (y0 < float(H)), wy0, zero)
+        wy1 = torch.where((y1 >= 0.0) & (y1 < float(H)), wy1, zero)
+        wz0 = torch.where((z0 >= 0.0) & (z0 < float(D)), wz0, zero)
+        wz1 = torch.where((z1 >= 0.0) & (z1 < float(D)), wz1, zero)
+
+        x0_i = x0.clamp(0.0, float(W - 1)).to(torch.int32)
+        x1_i = x1.clamp(0.0, float(W - 1)).to(torch.int32)
+        y0_i = y0.clamp(0.0, float(H - 1)).to(torch.int32) * W
+        y1_i = y1.clamp(0.0, float(H - 1)).to(torch.int32) * W
+        z0_i = z0.clamp(0.0, float(D - 1)).to(torch.int32) * HW
+        z1_i = z1.clamp(0.0, float(D - 1)).to(torch.int32) * HW
+
+        x_flat = x.reshape(-1, self.c, DHW)
+
+        def gather_corner(zi: torch.Tensor, yi: torch.Tensor, xi: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            idx = (zi + yi + xi).reshape(-1, 1, DHW).expand(-1, self.c, DHW)
+            val = torch.gather(x_flat, 2, idx.to(torch.int64))
+            return val * w.reshape(-1, 1, DHW)
+
+        out = (
+            gather_corner(z0_i, y0_i, x0_i, wz0 * wy0 * wx0)
+            + gather_corner(z0_i, y0_i, x1_i, wz0 * wy0 * wx1)
+            + gather_corner(z0_i, y1_i, x0_i, wz0 * wy1 * wx0)
+            + gather_corner(z0_i, y1_i, x1_i, wz0 * wy1 * wx1)
+            + gather_corner(z1_i, y0_i, x0_i, wz1 * wy0 * wx0)
+            + gather_corner(z1_i, y0_i, x1_i, wz1 * wy0 * wx1)
+            + gather_corner(z1_i, y1_i, x0_i, wz1 * wy1 * wx0)
+            + gather_corner(z1_i, y1_i, x1_i, wz1 * wy1 * wx1)
+        )
+        return out.reshape(-1, self.c, D, H, W)
+
+
+def _replace_grid_sample_5d(graph: gs.Graph) -> int:
+    """Replace 5D ``GridSample`` ops in ``warp_network_ori.onnx`` with standard ONNX ops."""
+    channels_by_name = {
+        "/dense_motion_network/GridSample": 4,
+        "/GridSample": 32,
+    }
+    replaced = 0
+    for node in list(graph.nodes):
+        if node.op != "GridSample":
+            continue
+        c = channels_by_name.get(node.name)
+        if c is None:
+            continue
+        mod = _GridSample3DModule(c=c).eval()
+        dummy_x = torch.zeros(2, c, 16, 64, 64, dtype=torch.float32)
+        dummy_g = torch.zeros(2, 16, 64, 64, 3, dtype=torch.float32)
+        buf = io.BytesIO()
+        with torch.no_grad():
+            torch.onnx.export(
+                mod,
+                (dummy_x, dummy_g),
+                buf,
+                input_names=["x_in", "grid_in"],
+                output_names=["y_out"],
+                opset_version=17,
+                dynamic_axes={"x_in": {0: "N"}, "grid_in": {0: "N"}, "y_out": {0: "N"}},
+                dynamo=False,
+            )
+        sub_proto = onnx.load_from_string(buf.getvalue())
+        sub_graph = gs.import_onnx(sub_proto)
+        prefix = f"gs3d_{replaced}"
+        for sub_node in sub_graph.nodes:
+            sub_node.name = f"{prefix}/{sub_node.name}"
+        for var in sub_graph.tensors().values():
+            var.name = f"{prefix}/{var.name}"
+
+        sub_x, sub_g = sub_graph.inputs[0], sub_graph.inputs[1]
+        sub_y = sub_graph.outputs[0]
+        orig_x, orig_g = node.inputs[0], node.inputs[1]
+        orig_y = node.outputs[0]
+
+        for sub_node in sub_graph.nodes:
+            sub_node.inputs = [
+                orig_x if inp is sub_x else (orig_g if inp is sub_g else inp)
+                for inp in sub_node.inputs
+            ]
+            sub_node.outputs = [
+                orig_y if out is sub_y else out
+                for out in sub_node.outputs
+            ]
+            graph.nodes.append(sub_node)
+
+        node.inputs.clear()
+        node.outputs.clear()
+        graph.nodes.remove(node)
+        replaced += 1
+    return replaced
+
+
 def _build_warp(
     onnx_path: Path,
     out_path: Path,
-    plugin_path: Path,
+    plugin_path: Path | None,
     *,
     max_batch: int,
     fp16: bool,
@@ -383,6 +524,9 @@ def _build_warp(
     model = onnx.load(str(onnx_path))
     graph = gs.import_onnx(model)
     _surge_warp(graph)
+    n_gs = _replace_grid_sample_5d(graph)
+    if n_gs:
+        print(f"[warp] decomposed {n_gs} 5D GridSample nodes into standard ONNX ops")
     for tensor in list(graph.inputs) + list(graph.outputs):
         new_shape = list(tensor.shape)
         new_shape[0] = "batch"
@@ -391,7 +535,9 @@ def _build_warp(
     new_model = gs.export_onnx(graph)
     _symbolize_batch(new_model)
 
-    ctypes.cdll.LoadLibrary(str(plugin_path))
+    if plugin_path is not None and plugin_path.is_file():
+        if not (sys.platform == "win32" and plugin_path.suffix.lower() == ".so"):
+            ctypes.cdll.LoadLibrary(str(plugin_path))
 
     logger = _FilteredLogger()
     trt.init_libnvinfer_plugins(logger, "")
@@ -740,7 +886,15 @@ def main(argv: list[str] | None = None) -> None:
         out = _out("warp_network", f"warp_network_b5_{suffix}.engine")
         out.parent.mkdir(parents=True, exist_ok=True)
         plugin = args.warp_plugin if args.warp_plugin is not None else mgr.storage_path("warp_plugin")
-        _build_warp(_onnx(args.warp_onnx, "warp_network_onnx"), out, plugin, max_batch=args.max_batch, fp16=fp16)
+        use_ori_warp = sys.platform == "win32" and (args.warp_plugin is None or plugin.suffix.lower() == ".so")
+        warp_artifact = "warp_network_ori_onnx" if use_ori_warp else "warp_network_onnx"
+        _build_warp(
+            _onnx(args.warp_onnx, warp_artifact),
+            out,
+            None if use_ori_warp else plugin,
+            max_batch=args.max_batch,
+            fp16=fp16,
+        )
         written.append(out)
     if "modnet" in requested:
         out = _out("modnet", f"modnet_b5_{suffix}.engine")

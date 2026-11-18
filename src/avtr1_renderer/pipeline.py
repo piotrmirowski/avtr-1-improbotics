@@ -31,6 +31,7 @@ requires TRT (run ``scripts/build_avtr1_engines.py`` before first use).
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 import torch
 
@@ -175,17 +176,22 @@ class Pipeline[StateT]:
             DecoderOutput,
         )
 
-        # Warp needs the grid-sample plugin when running in TRT mode.
+        # Warp needs the grid-sample plugin when running in TRT mode (on Linux).
         warp_trt = get_trt_engine_path("warp_network")
         if warp_trt.is_file():
             plugin_path = mgr.storage_path("warp_plugin")
+            use_plugin = (
+                plugin_path.is_file()
+                and not (sys.platform == "win32" and plugin_path.suffix.lower() == ".so")
+            )
             warp = load_engine(
                 warp_trt, WarpInput, WarpOutput,
-                plugin_files=[str(plugin_path)] if plugin_path.is_file() else [],
+                plugin_files=[str(plugin_path)] if use_plugin else [],
             )
         else:
+            warp_onnx_key = "warp_network_ori_onnx" if sys.platform == "win32" else "warp_network_onnx"
             warp = load_engine(
-                find_engine_or_onnx("warp_network", "warp_network_onnx"),
+                find_engine_or_onnx("warp_network", warp_onnx_key),
                 WarpInput,
                 WarpOutput,
             )

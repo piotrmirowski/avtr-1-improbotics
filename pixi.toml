@@ -1,16 +1,20 @@
 [workspace]
 channels = ["https://prefix.dev/conda-forge"]
 name = "avtr1-live-talkinghead"
-platforms = ["linux-64"]
+platforms = ["linux-64", "win-64"]
 version = "0.1.0"
 
 [system-requirements]
 cuda = "12.8"
 
+[activation.env]
+KMP_DUPLICATE_LIB_OK = "TRUE"
+
 [tasks]
 hf-login         = { cmd = "hf auth login", description = "Log in to HuggingFace (required before downloading artifacts)" }
 download         = { cmd = "python scripts/download_artifacts.py", description = "Download all model artifacts from HuggingFace", depends-on = ["hf-login"] }
 generate_offline = { cmd = "python scripts/generate_offline.py", description = "Run end-to-end offline generation (requires built engines)" }
+generate_video   = { cmd = "python scripts/generate_from_video.py", description = "Run video-driven face reenactment on an avatar" }
 
 [dependencies]
 python = "==3.12"
@@ -48,7 +52,7 @@ kornia = ">=0.8.1,<0.9"
 scikit-image = ">=0.25.2,<0.26"
 soxr = ">=0.4.0,<0.5"
 roma = ">=1.5.4,<2"
-onnxruntime-gpu = ">=1.20"
+onnxruntime-gpu = ">=1.20,<=1.26.0"
 av = ">=17.0.1,<18"
 soundfile = ">=0.13.1,<0.14"
 safetensors = ">=0.5,<1"

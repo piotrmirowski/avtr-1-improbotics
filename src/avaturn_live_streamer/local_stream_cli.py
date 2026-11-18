@@ -203,7 +203,7 @@ def _make_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
-        return _UI_HTML_PATH.read_text()
+        return _UI_HTML_PATH.read_text(encoding="utf-8")
 
     @app.get("/avatars")
     async def avatars_route() -> dict[str, object]:

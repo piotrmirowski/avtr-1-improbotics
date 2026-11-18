@@ -108,7 +108,7 @@ def main() -> None:
                         help="Force render duration in seconds; audio is trimmed/padded to fit")
     parser.add_argument("--avatar", default="maria", help="Avatar ID to render")
     parser.add_argument("--out", type=Path, default=Path("demo_output.mp4"))
-    parser.add_argument("--bg", required=True, help="Background ID (must match a file in the backgrounds artifact, e.g. 'plain_white')")
+    parser.add_argument("--bg", default="plain_white", help="Background ID (must match a file in the backgrounds artifact, default: 'plain_white')")
     parser.add_argument(
         "--no-mux", dest="mux", action="store_false",
         help="Don't mux the speech audio into the output video.",

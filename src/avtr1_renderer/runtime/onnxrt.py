@@ -31,11 +31,14 @@ Limitations vs ``TRTEngine``:
 from __future__ import annotations
 
 from dataclasses import fields, is_dataclass
+import os
 from typing import Any
 
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import numpy as np
-import onnxruntime as ort
 import torch
+import onnxruntime as ort
 
 _ORT_TYPE_TO_TORCH: dict[str, torch.dtype] = {
     "tensor(float)": torch.float32,

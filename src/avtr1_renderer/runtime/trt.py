@@ -5,8 +5,8 @@ import ctypes
 from collections.abc import Iterable
 from dataclasses import fields, is_dataclass
 
-import tensorrt as trt
 import torch
+import tensorrt as trt
 
 _logger = trt.Logger(trt.Logger.ERROR)
 trt.init_libnvinfer_plugins(_logger, "")
